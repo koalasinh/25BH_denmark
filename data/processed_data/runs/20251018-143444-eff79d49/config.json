@@ -1,0 +1,77 @@
+{
+  "batch_size": 64,
+  "catalyst_feat_csv": "Catalyst_1cal_2iloc_3select.csv",
+  "data_dir": "data",
+  "device": "cuda",
+  "do_explain_edge": true,
+  "do_explain_feature": true,
+  "do_explain_node": true,
+  "do_graph_viz": true,
+  "do_train_curves": true,
+  "dropout": 0.3,
+  "early_stop_patience": 80,
+  "early_stopping": true,
+  "epochs": 600,
+  "feat_cols_catalyst": null,
+  "feat_cols_imine": null,
+  "feat_cols_thiol": null,
+  "feature_scale_mode": "zscore",
+  "gat_heads": 4,
+  "gat_hidden": 256,
+  "huber_delta": 1.0,
+  "id_col_catalyst": "Catalyst",
+  "id_col_imine": "Imine",
+  "id_col_thiol": "Thiol",
+  "imine_feat_csv": "Imine_1cal_2iloc_3select.csv",
+  "input_dim": 100,
+  "label_col": "output",
+  "lr": 0.0002,
+  "mlp_sizes": [
+    512,
+    256,
+    128
+  ],
+  "node_labels": {
+    "0": "Imine",
+    "1": "Thiol",
+    "2": "Catalyst"
+  },
+  "node_positions": {
+    "0": [
+      0.0,
+      0.0
+    ],
+    "1": [
+      2.0,
+      0.0
+    ],
+    "2": [
+      1.0,
+      1.0
+    ]
+  },
+  "normalize_label": false,
+  "num_workers": 0,
+  "pooling": "gap+gmp",
+  "processed_subdir": "processed_data",
+  "reactions_csv": "denmark.csv",
+  "run_name": "",
+  "rxn_col_catalyst": "catalyst",
+  "rxn_col_imine": "imine",
+  "rxn_col_thiol": "thiol",
+  "save_outputs": true,
+  "save_processed_dataset": true,
+  "scheduler_factor": 0.5,
+  "scheduler_patience": 18,
+  "seed": 42,
+  "standardize_features": true,
+  "thiol_feat_csv": "Thiol_1cal_2iloc_3select.csv",
+  "topk_feat": 10,
+  "train_count": 600,
+  "train_ratio": 0.8,
+  "use_fixed_split": true,
+  "use_huber": true,
+  "use_scheduler": true,
+  "val_count": 475,
+  "weight_decay": 0.0001
+}

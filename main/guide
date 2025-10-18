@@ -1,0 +1,267 @@
+结论先说：
+- 目前我们已将训练指标、历史曲线、解释结果等分别写入 data/processed_data，但还没有“运行登记/报告索引”的总表，也没有“每次运行的独立目录+配置快照”的规范化管理。
+- 你要的目标是“可追踪、可复现”的实验管理：每次训练都生成一份配置快照和本次的结果文件，统一登记到一张总表，后续可直接通过导入该配置复现实验。这非常合理，建议引入一个轻量的 Run 管理组件。
+
+下面给出最小而完整的集成方案（代码补丁片段），实现：
+- 每次运行自动生成 run_id（时间戳+短哈希），在 data/processed_data/runs/{run_id}/ 下保存
+  - config.json（本次全部配置快照）
+  - metrics.json（最终指标，原始尺度）
+  - training_history.json（训练曲线）
+  - best_model.pt（最佳模型权重）
+  - val_predictions.csv（可选，验证集真值/预测/残差，便于误差分析）
+  - 解释结果 CSV（若开启）
+  - 曲线与图 PNG（若开启）
+- 在 data/processed_data/runs_index.csv 维护一张“运行索引表”，
+汇总 run_id、时间、关键配置（如 pooling、gat_hidden、lr、权重衰减等）与指标（R2、RMSE、MAE、MSE）。
+- 支持“从配置文件复现”：提供一个函数 load_config_and_run(path_to_config_json) 直接复现实验。
+
+一）sr_config.py：增加可选运行名
+```python
+class Config:
+    # ... 原有字段 ...
+    # 可选：自定义本次运行的名字，便于识别（若为空将用时间戳+哈希）
+    run_name: str = ""
+```
+
+二）sr_utils.py：新增运行管理工具
+```python
+import time, hashlib
+from dataclasses import asdict, is_dataclass
+
+def config_to_dict(cfg) -> dict:
+    # 将 Config 对象转 dict（简单起见，直接取 __dict__）
+    # 如使用 dataclass，可用 asdict
+    d = {k: getattr(cfg, k) for k in dir(cfg) if not k.startswith("_") and not callable(getattr(cfg, k))}
+    # 过滤掉非内置类型（如设备对象），转字符串
+    out = {}
+    for k, v in d.items():
+        try:
+            json.dumps(v)  # 尝试序列化
+            out[k] = v
+        except Exception:
+            out[k] = str(v)
+    return out
+
+def make_run_id(cfg_dict: dict) -> str:
+    # 时间戳 + 配置哈希的短码
+    ts = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    h = hashlib.md5(json.dumps(cfg_dict, sort_keys=True).encode("utf-8")).hexdigest()[:8]
+    return f"{ts}-{h}"
+
+class RunManager:
+    """
+    负责：
+    - 生成 run_id 和 run 目录
+    - 保存 config.json / metrics.json / training_history.json / best_model.pt / val_predictions.csv 等
+    - 维护 runs_index.csv（总表）
+    """
+    def __init__(self, outman: OutputManager, cfg):
+        self.outman = outman
+        self.cfg_dict = config_to_dict(cfg)
+        # run_id：优先 run_name，否则时间戳+哈希
+        self.run_id = cfg.run_name.strip() or make_run_id(self.cfg_dict)
+        self.run_dir = self.outman.path(f"runs/{self.run_id}")
+        if self.outman.save_outputs:
+            self.outman.ensure_dirs()
+            os.makedirs(self.run_dir, exist_ok=True)
+
+    def path(self, filename: str) -> str:
+        return os.path.join(self.run_dir, filename)
+
+    def save_config(self):
+        if not self.outman.save_outputs: return
+        with open(self.path("config.json"), "w", encoding="utf-8") as f:
+            json.dump(self.cfg_dict, f, ensure_ascii=False, indent=2)
+
+    def save_metrics(self, metrics: dict):
+        if not self.outman.save_outputs: return
+        with open(self.path("metrics.json"), "w", encoding="utf-8") as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+    def save_history(self, history: dict):
+        if not self.outman.save_outputs: return
+        with open(self.path("training_history.json"), "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+
+    def save_model(self, state_dict: dict):
+        if not self.outman.save_outputs: return
+        torch.save(state_dict, self.path("best_model.pt"))
+
+    def save_csv_local(self, filename: str, df: pd.DataFrame):
+        if not self.outman.save_outputs: return
+        df.to_csv(self.path(filename), index=False, encoding="utf-8")
+
+    def append_runs_index(self, metrics: dict):
+        """
+        追加一行到 data/processed_data/runs_index.csv
+        包含 run_id、时间、关键配置与指标，便于纵览历史运行。
+        """
+        if not self.outman.save_outputs: return
+        idx_path = self.outman.path("runs_index.csv")
+        row = {
+            "run_id": self.run_id,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "pooling": self.cfg_dict.get("pooling"),
+            "gat_hidden": self.cfg_dict.get("gat_hidden"),
+            "gat_heads": self.cfg_dict.get("gat_heads"),
+            "dropout": self.cfg_dict.get("dropout"),
+            "lr": self.cfg_dict.get("lr"),
+            "weight_decay": self.cfg_dict.get("weight_decay"),
+            "epochs": self.cfg_dict.get("epochs"),
+            "batch_size": self.cfg_dict.get("batch_size"),
+            "use_huber": self.cfg_dict.get("use_huber"),
+            "normalize_label": self.cfg_dict.get("normalize_label"),
+            "standardize_features": self.cfg_dict.get("standardize_features"),
+            # 指标
+            "R2": metrics.get("R2"),
+            "RMSE": metrics.get("RMSE"),
+            "MAE": metrics.get("MAE"),
+            "MSE": metrics.get("MSE"),
+        }
+        df_row = pd.DataFrame([row])
+        if os.path.exists(idx_path):
+            df_old = pd.read_csv(idx_path, encoding="utf-8")
+            df_new = pd.concat([df_old, df_row], axis=0, ignore_index=True)
+        else:
+            df_new = df_row
+        df_new.to_csv(idx_path, index=False, encoding="utf-8")
+```
+
+三）sr_trainer.py：接入 RunManager，导出验证集逐样本预测
+在 Trainer.__init__ 末尾创建 run_manager；在保存最佳与评估处调用。
+只示例关键新增/修改点（其余逻辑不变）：
+```python
+from sr_utils import OutputManager, compute_metrics, RunManager
+
+class Trainer:
+    def __init__(self, cfg: Config):
+        # ... 原有初始化 ...
+        self.outman = OutputManager(cfg.data_dir, cfg.processed_subdir, cfg.save_outputs)
+        # 新增：run 管理器
+        self.runman = RunManager(self.outman, cfg)
+        self.runman.save_config()  # 运行开始时立即保存本次配置快照
+
+        # ... 原有数据、模型、优化器等初始化 ...
+
+    def fit(self):
+        # ... 训练循环 ...
+        if best_state is not None and self.cfg.save_outputs:
+            self.model.load_state_dict(best_state)
+            # 保存最佳模型到本次 run 目录
+            self.runman.save_model(best_state)
+
+    def evaluate(self) -> Dict[str, float]:
+        # ... 组装 y_true/y_pred（缩放空间）并反归一化到原尺度 ...
+        metrics = compute_metrics(y_true, y_pred)
+        print("Validation metrics (original scale):", metrics)
+
+        if self.cfg.save_outputs:
+            # 保存最终指标、训练曲线到本次 run 目录
+            self.runman.save_metrics(metrics)
+            hist = {
+                "train_loss": self.history["train_loss"],
+                "val_loss": self.history["val_loss"],
+                "val_r2": self.history["val_r2"]
+            }
+            self.runman.save_history(hist)
+            # 追加到 runs_index.csv（总表）
+            self.runman.append_runs_index(metrics)
+            # 可选：导出逐样本验证集预测对比（原始尺度）
+            import pandas as pd
+            df_pred = pd.DataFrame({
+                "y_true": y_true,
+                "y_pred": y_pred,
+                "residual": y_pred - y_true
+            })
+            self.runman.save_csv_local("val_predictions.csv", df_pred)
+
+        return metrics
+```
+
+四）sr_explain.py 和 sr_viz.py：把输出也写入 run 目录
+- 将原来 self.outman.save_csv(...) 改为 self.runman.save_csv_local(...)，图像保存用 self.runman.path(...)。
+最简方式是在 train.py 中构造 Explainer/Visualizer 时把 runman 传进去。
+
+示例（train.py 中）：
+```python
+# 训练后
+trainer = Trainer(cfg)
+trainer.fit()
+metrics = trainer.evaluate()
+
+# 解释
+if cfg.do_explain_node or cfg.do_explain_edge or cfg.do_explain_feature:
+    explainer = Explainer(trainer.model, trainer.val_loader, trainer.full_dataset_ref,
+                          outman=trainer.outman, cfg=cfg)
+    # 将 Explainer 改成可选接收 runman，并用 runman 保存
+    # explainer = Explainer(..., runman=trainer.runman)
+    # 然后在 explainer 内部用 self.runman.save_csv_local(...) 保存到本次 run 目录
+    # 为了不大改动，你也可以直接把返回的 DataFrame 手动保存：
+    if cfg.do_explain_node:
+        df = explainer.node_importance()
+        trainer.runman.save_csv_local("explain_node_importance.csv", df)
+    if cfg.do_explain_edge:
+        df = explainer.edge_importance()
+        trainer.runman.save_csv_local("explain_edge_importance.csv", df)
+    if cfg.do_explain_feature:
+        df = explainer.feature_importance(topk=cfg.topk_feat)
+        trainer.runman.save_csv_local("explain_feature_importance.csv", df)
+
+# 可视化
+if cfg.do_graph_viz or cfg.do_train_curves:
+    viz = Visualizer(lambda name: trainer.runman.path(name))
+    if cfg.do_graph_viz:
+        viz.plot_triangle_graph(cfg.node_positions, cfg.node_labels, filename="triangle_graph.png")
+    if cfg.do_train_curves:
+        history = {"train_loss": trainer.history["train_loss"],
+                   "val_loss": trainer.history["val_loss"],
+                   "val_r2": trainer.history["val_r2"]}
+        viz.plot_training_curves(history, filename="training_curves.png")
+```
+
+五）从配置文件复现
+在 train.py 末尾添加一个辅助函数，传入 config.json 路径，加载后直接跑：
+```python
+import json
+from sr_config import Config
+
+def load_config_and_run(config_path: str):
+    with open(config_path, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    cfg = Config()
+    # 将 JSON 中的键值回填到 cfg
+    for k, v in d.items():
+        if hasattr(cfg, k):
+            setattr(cfg, k, v)
+    # 可选：为了复现，保持相同 seed；也可在这里覆盖 device 等
+    trainer = Trainer(cfg)
+    trainer.fit()
+    trainer.evaluate()
+
+# 用法示例：
+# load_config_and_run("data/processed_data/runs/20250101-120000-ab12cd34/config.json")
+```
+
+目录结构示意（运行一次后）
+- data/processed_data/runs/
+  - 20250101-120000-ab12cd34/
+    - config.json
+    - metrics.json
+    - training_history.json
+    - best_model.pt
+    - val_predictions.csv
+    - explain_node_importance.csv（若开启）
+    - explain_edge_importance.csv（若开启）
+    - explain_feature_importance.csv（若开启）
+    - triangle_graph.png（若开启）
+    - training_curves.png（若开启）
+- data/processed_data/runs_index.csv（所有运行汇总总表）
+
+这样你就可以：
+- 通过 runs_index.csv 快速纵览每次结果与关键配置；
+- 进入某个 run_id 目录查看详细报告文件；
+- 用该 run 的 config.json 一键复现。
+
+我可以继续帮你把上述改动直接合入到你当前的多文件版本，并贴出完整修改后的 sr_utils.py / sr_trainer.py / train.py 三个文件；
+要我直接发完整文件吗？
+另外，需要把 Explainer 内部也改成使用 runman 保存（更干净）吗，还是保持现在在 train.py 里保存 DataFrame 的方式即可？

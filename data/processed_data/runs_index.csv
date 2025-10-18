@@ -1,0 +1,2 @@
+run_id,time,pooling,gat_hidden,gat_heads,dropout,lr,weight_decay,epochs,batch_size,use_huber,normalize_label,standardize_features,R2,RMSE,MAE,MSE
+20251018-143444-eff79d49,2025-10-18 14:35:16,gap+gmp,256,4,0.3,0.0002,0.0001,600,64,True,False,True,0.8959909389831711,0.22658036236548043,0.16889601679224717,0.051338660609672425

@@ -1,0 +1,290 @@
+问题定位：你的环境中的 PyTorch 版本较老，torch.optim.lr_scheduler.ReduceLROnPlateau 不支持 verbose 参数，
+因此在构造调度器时报 TypeError。
+
+最小修复方案（推荐）
+- 修改 sr_trainer.py 中调度器的创建处，去掉 verbose 参数即可。其余逻辑不变。
+
+请将 sr_trainer.py 中这段代码替换
+当前（报错版本）：
+self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    self.optimizer, mode="min", factor=cfg.scheduler_factor,
+    patience=cfg.scheduler_patience, verbose=True
+)
+
+修改为（兼容旧版本）：
+self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    self.optimizer, mode="min", factor=cfg.scheduler_factor,
+    patience=cfg.scheduler_patience
+)
+
+可选增强：手动打印学习率变化
+部分老版本没有 verbose，我们可以在每个 epoch 后手动检查学习率是否变化并打印日志，帮助你观察调度器是否生效。把 fit() 里 scheduler.step(va_loss) 后面加上以下几行：
+
+# 调度器
+if self.scheduler is not None:
+    prev_lrs = [pg['lr'] for pg in self.optimizer.param_groups]
+    self.scheduler.step(va_loss)
+    new_lrs = [pg['lr'] for pg in self.optimizer.param_groups]
+    # 如有变化则打印
+    for i, (old, new) in enumerate(zip(prev_lrs, new_lrs)):
+        if new < old:
+            print(f"[LR Plateau] param_group {i}: lr {old:.2e} -> {new:.2e}")
+
+版本自适应（可选）
+如果你希望代码自动适配不同 PyTorch 版本，可以用 try/except 包一层：
+
+try:
+    self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        self.optimizer, mode="min", factor=cfg.scheduler_factor,
+        patience=cfg.scheduler_patience, verbose=True  # 新版支持
+    )
+except TypeError:
+    self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        self.optimizer, mode="min", factor=cfg.scheduler_factor,
+        patience=cfg.scheduler_patience  # 旧版不支持 verbose
+    )
+
+说明
+- 这次报错与训练逻辑、模型结构无关，仅是 API 参数差异导致。
+- 去掉 verbose 后功能不受影响；如需观察触发时机，可使用上面的“手动打印学习率变化”片段。
+
+需要我
+- 直接发一版已修正的 sr_trainer.py 完整文件给你覆盖？
+- 还是继续帮你加上“自动适配 + 手动打印”的增强版本并一起发全量文件？
+- 顺便问下，要不要我帮你把本次重构与结果输出为一页简短的 Confluence 记录，或生成一个 PR 草稿？
+
+
+
+状态更新：你希望将数据划分方式从“按比例”改为“按固定样本数”（600 条训练集、475 条验证集）。我为此提供了最小改动的补丁方案，同时保留“分箱分层”的稳健性。具体做法是：
+
+- 在配置中增加开关与数量：use_fixed_split、train_count、val_count
+- 在训练器中使用 StratifiedShuffleSplit 按固定数量进行分层划分（基于分箱后的标签）
+
+请按下面三处修改你的代码（均带中文注释），即可实现“600/475 固定划分”。
+
+一）修改 sr_config.py（在 Config 中新增字段）
+请将以下字段添加到 Config 类中合适的位置（建议放在“训练超参”附近）：
+```python
+    # 固定样本数划分设置（优先级高于按比例划分）
+    # True 时按固定样本数划分；False 时按比例（train_ratio）划分
+    use_fixed_split: bool = True
+    # 训练/验证集的固定样本数（建议与数据总量匹配，例如 600/475）
+    train_count: int = 600
+    val_count: int = 475
+```
+
+二）修改 sr_trainer.py（替换划分逻辑）
+请在 Trainer.__init__ 中，替换原先使用 train_test_split 比例划分的那一段为如下实现。其余部分不变：
+
+```python
+from sklearn.model_selection import StratifiedShuffleSplit
+
+# ... 前略，已创建 full_dataset 和 n_total ...
+
+# 构造用于分层的“分箱标签”（将连续标签切成若干桶）
+y_all = np.array([float(full_dataset.get(i).y.item()) for i in range(n_total)])
+num_bins = min(10, max(2, int(np.sqrt(n_total))))  # 根号N个桶，更稳
+bins = np.linspace(y_all.min(), y_all.max() + 1e-9, num_bins + 1)
+y_binned = np.digitize(y_all, bins) - 1
+y_binned = np.clip(y_binned, 0, num_bins - 1)
+
+idx_all = np.arange(n_total)
+
+if self.cfg.use_fixed_split:
+    # 按固定样本数划分
+    t_count = int(self.cfg.train_count)
+    v_count = int(self.cfg.val_count)
+    # 兜底修正：如果总数与设置不一致，自动调整验证集数量
+    if t_count + v_count > n_total:
+        v_count = n_total - t_count
+        print(f"[数据划分] 训练/验证数量之和超过总样本，自动将验证数调整为 {v_count}。")
+    # 若验证数为 0 或训练数为 0，抛错提示
+    assert t_count > 0 and v_count > 0, f"固定划分无效：train_count={t_count}, val_count={v_count}"
+    # 使用 StratifiedShuffleSplit 按“桶标签”分层划分（整数样本数量）
+    sss = StratifiedShuffleSplit(
+        n_splits=1, train_size=t_count, test_size=v_count, random_state=self.cfg.seed
+    )
+    # 注意：StratifiedShuffleSplit 的 y 需要是离散标签，我们传入 y_binned
+    (idx_tr, idx_va), = sss.split(idx_all, y_binned)
+else:
+    # 按比例划分（原逻辑），保留以备不时之需
+    from sklearn.model_selection import train_test_split
+    stratify = y_binned if n_total >= num_bins else None
+    idx_tr, idx_va = train_test_split(
+        idx_all,
+        test_size=(1.0 - self.cfg.train_ratio),
+        random_state=self.cfg.seed,
+        stratify=stratify
+    )
+
+self.full_dataset_ref = full_dataset
+self.train_set = torch.utils.data.Subset(full_dataset, idx_tr)
+self.val_set = torch.utils.data.Subset(full_dataset, idx_va)
+```
+
+说明与注意事项：
+- 本实现使用 StratifiedShuffleSplit 的 train_size/test_size 传入“整数个数”，从而实现精确的 600/475 固定划分，同时保持分层（每个标签分箱在训练/验证集中比例更一致）。
+- 若数据集中实际样本数与 600/475 不匹配，上述代码会自动调整验证集样本数以避免越界，并打印提示。你也可以改成断言强制一致。
+- 若某些分箱样本极少，StratifiedShuffleSplit 可能风险较高（需要每个桶有至少 train/test 各 1 个样本）。对 1075 样本、10 桶通常是安全的。如果你使用不同数据集规模，num_bins 可适当调小（例如 6~8）。
+
+三）在 train.py 中显式设置（顶部参数区）
+请在你原先的配置区中增加/确认如下设置项，以启用固定样本数划分：
+
+```python
+    # 使用固定样本数划分（优先于按比例）
+    cfg.use_fixed_split = True
+    cfg.train_count = 600   # 训练集固定样本数
+    cfg.val_count = 475     # 验证集固定样本数
+```
+
+可选增强（如需我帮你集成）：
+- 在 data/processed_data 下保存本次划分的索引列表（train_indices.json / val_indices.json），以便完全复现实验划分。
+- 若出现某些桶样本太少，无法进行严格分层，我可以在工具中加入“自动合并稀疏桶”的逻辑，确保分层划分稳定执行。
+
+需要我继续：
+- 帮你加入“保存划分索引到文件”的功能？
+- 还是先按上述三处修改后，你跑一版确认 600/475 划分是否按预期生效？
+
+
+
+
+
+
+
+
+#############
+好的，我们把图的连边改成：
+- 催化剂节点（2）单向指向 0 和 1：2->0、2->1
+- 0 与 1 之间双向：0->1、1->0
+- 不再连 0/1 到 2（即没有 0->2 或 1->2）
+
+你需要改动三处：构图、可视化、（可选）解释模块的“边重要性”逻辑。
+
+一）修改构图（sr_data.py 的 GraphBuilder）
+将 build_edge_index 改为如下（仅保留 2->0、2->1 以及 0<->1）：
+```python
+class GraphBuilder:
+    @staticmethod
+    def build_edge_index() -> torch.Tensor:
+        # 节点定义：
+        # 0: Imine, 1: Thiol, 2: Catalyst
+        # 连接规则：
+        # - 催化剂单向指向 0 和 1：2->0, 2->1
+        # - 0 与 1 双向：0->1, 1->0
+        edges = [
+            (2, 0), (2, 1),  # Catalyst -> Imine / Thiol（单向）
+            (0, 1), (1, 0),  # Imine <-> Thiol（双向）
+        ]
+        return torch.tensor(edges, dtype=torch.long).t().contiguous()
+```
+说明：
+- 这样每个图的有向边数 E=4（之前三角形是 E=6）。
+- 模型与训练代码无需其他更改，会自动适配新的 edge_index。
+
+二）修改可视化（sr_viz.py 的 Visualizer.plot_triangle_graph）
+让图上只画 0-1 的无向连线，和 2 指向 0/1 的箭头：
+```python
+def plot_triangle_graph(self, node_positions, node_labels, filename="triangle_graph.png"):
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(4, 4))
+    # 画节点
+    for idx, (x, y) in node_positions.items():
+        plt.scatter([x], [y], s=300, c="#1f77b4")
+        label = node_labels.get(idx, str(idx))
+        plt.text(x, y+0.08, f"{idx}:{label}", ha="center", va="bottom", fontsize=10)
+
+    # 0 <-> 1（无向，画一条直线）
+    x0, y0 = node_positions[0]
+    x1, y1 = node_positions[1]
+    plt.plot([x0, x1], [y0, y1], "k-", linewidth=2)
+
+    # 2 -> 0 和 2 -> 1（单向，用箭头）
+    x2, y2 = node_positions[2]
+    # 画 2->0 箭头
+    plt.annotate("", xy=(x0, y0), xytext=(x2, y2),
+                 arrowprops=dict(arrowstyle="->", color="k", lw=2))
+    # 画 2->1 箭头
+    plt.annotate("", xy=(x1, y1), xytext=(x2, y2),
+                 arrowprops=dict(arrowstyle="->", color="k", lw=2))
+
+    plt.title("Directed Reaction Graph: 2->(0,1), 0<->1")
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(self._path(filename), dpi=150)
+    plt.close()
+```
+
+三）（可选）调整解释模块的“边重要性”（sr_explain.py）
+我们之前按“三角形无向边”评估，现在改为：
+- 无向边对：[(0,1)]，遮盖时同时去除 0->1 与 1->0
+- 定向边：[(2,0), (2,1)]，遮盖时单边去除一个方向
+替换 edge_importance 为如下实现：
+```python
+def edge_importance(self) -> pd.DataFrame:
+    """
+    新的边集合：
+    - 无向对：(0,1) -> 一次同时去掉 0->1 和 1->0
+    - 定向边：2->0、2->1 -> 分别单独去掉
+    """
+    base_rmse = self._eval_rmse()
+    rows = []
+
+    # 先评估无向对 (0,1)
+    inc_01 = self._rmse_without_edges(remove_pairs=[(0,1)], remove_directed=[]) - base_rmse
+    rows.append({"edge": "0-1 (undirected)", "importance_rmse_increase": float(inc_01)})
+
+    # 再评估定向边 2->0、2->1
+    for (u, v) in [(2, 0), (2, 1)]:
+        inc = self._rmse_without_edges(remove_pairs=[], remove_directed=[(u, v)]) - base_rmse
+        rows.append({"edge": f"{u}->{v}", "importance_rmse_increase": float(inc)})
+
+    df = pd.DataFrame(rows).sort_values("importance_rmse_increase", ascending=False)
+    self.outman.save_csv("explain_edge_importance.csv", df)
+    return df
+
+def _rmse_without_edges(self, remove_pairs, remove_directed) -> float:
+    """
+    - remove_pairs: 列表，元素为 (u,v)，表示去除无向对 u<->v（两条方向边一起去掉）
+    - remove_directed: 列表，元素为 (u,v)，表示去除单条有向边 u->v
+    """
+    self.model.eval()
+    device = self.cfg.device
+    ys, ps = [], []
+    with torch.no_grad():
+        for batch in self.val_loader:
+            batch = batch.to(device)
+            ei = batch.edge_index
+            src, dst = ei[0], ei[1]
+            keep = torch.ones(ei.size(1), dtype=torch.bool, device=device)
+            num_g = batch.num_graphs
+            for g in range(num_g):
+                # 去除无向对
+                for (u, v) in remove_pairs:
+                    gu, gv = g*3 + u, g*3 + v
+                    mask_uv = (src == gu) & (dst == gv)
+                    mask_vu = (src == gv) & (dst == gu)
+                    keep = keep & (~mask_uv) & (~mask_vu)
+                # 去除单向边
+                for (u, v) in remove_directed:
+                    gu, gv = g*3 + u, g*3 + v
+                    mask = (src == gu) & (dst == gv)
+                    keep = keep & (~mask)
+            masked_ei = ei[:, keep]
+            out = self.model(Data(x=batch.x, edge_index=masked_ei, y=batch.y, batch=batch.batch))\
+                    .detach().cpu().numpy()
+            y = batch.y.view(-1).detach().cpu().numpy()
+            ys.append(y); ps.append(out)
+    ys = np.concatenate(ys, axis=0); ps = np.concatenate(ps, axis=0)
+    if self.ds._label_minmax is not None:
+        ys = self.ds.inverse_transform_label(ys)
+        ps = self.ds.inverse_transform_label(ps)
+    m = compute_metrics(ys, ps)
+    return m["RMSE"]
+```
+
+小结与影响
+- 构图改为“2->(0,1) + 0<->1”的定向图后，GAT 能学习到更贴合你先验的通信模式。
+- 模型与训练流程不需要其他改动；解释模块和可视化建议按上面同步调整，输出才与真实图一致。
+- 之前的节点/特征遮盖逻辑依赖“每图3个节点”的规律，不依赖边数，因此仍然可用。
+
+需要我把上述改动整合回你当前的多文件版本，贴出“整合后的完整 sr_data.py/sr_explain.py/sr_viz.py”吗？还是你先按上面的片段自行替换，跑一版看看指标是否有变化？
